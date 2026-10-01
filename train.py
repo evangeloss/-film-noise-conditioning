@@ -47,6 +47,33 @@ def evaluate(model,sim,alpha,n,batch,seed,snr=None):
     return np.asarray(values),metadata
 
 
+@torch.no_grad()
+def clean_physics_target(bridge,data):
+    """Return the noiseless PhysicsBridge output in the SAME normalization as noisy x/y.
+
+    The clean observations are divided by the noisy-scene scale used by the network.
+    This makes the target directly comparable to the noisy bridge output and isolates
+    only the noise-induced bridge error.
+    """
+    if 'clean' not in data:
+        raise KeyError('clean observations are required; call Simulator.batch(..., return_clean=True)')
+    clean_x=pack(data['clean'])/data['scale'][:,None,None,None]
+    zero_variance=torch.zeros_like(data['variance'])
+    return bridge(clean_x,zero_variance)
+
+
+@torch.no_grad()
+def evaluate_clean_physics(model,sim,alpha,n,batch,seed,snr=None):
+    """NMSE to the clean-PhysicsBridge target, used only as a denoising diagnostic."""
+    model.eval();values=[]
+    for j,start in enumerate(range(0,n,batch)):
+        data=sim.batch(min(batch,n-start),seed+j,alpha,snr,return_clean=True)
+        prediction=model(data['x'],data['variance'],data['scale'])
+        target=clean_physics_target(model.bridge,data)
+        values.extend(nmse(prediction,target).cpu().tolist())
+    return np.asarray(values)
+
+
 class Baseline(torch.nn.Module):
     def __init__(self,bridge,kind):super().__init__();self.bridge=bridge;self.kind=kind
     def forward(self,x,v,s):
@@ -86,6 +113,8 @@ def main():
                    help='Fixed SNRs used for final evaluation')
     p.add_argument('--noise-conditioning',choices=['film','none'],default='film',
                    help='Explicit noise conditioning in the residual CNN')
+    p.add_argument('--training-target',choices=['true_channel','clean_physics'],default='true_channel',
+                   help='Training supervision. clean_physics learns only the noise-induced PhysicsBridge correction.')
     a=p.parse_args()
     if a.quick:
         a.epochs=2;a.steps=2;a.batch_size=4;a.validation_scenes=8;a.test_scenes=8;a.atoms=32;a.rank=16;a.width=8;a.seeds=[11]
@@ -105,9 +134,11 @@ def main():
         or a.epochs*a.steps>=100000):p.error('Invalid dimensions, seeds, amplitudes, or >=100000 training batches/seed')
     if not a.train_only and (a.regimes!=['large','small'] or a.model_kinds!=['hybrid','direct']):
         p.error('Subset training requires --train-only; use evaluate_sweep.py afterward')
+    if a.training_target=='clean_physics' and any(k!='hybrid' for k in a.model_kinds):
+        p.error('--training-target clean_physics is defined for hybrid models only')
     regimes=[(label,getattr(a,f'{label}_alpha')) for label in dict.fromkeys(a.regimes)]
     config={k:str(v) if isinstance(v,Path) else v for k,v in vars(a).items() if k not in ('resume','output')}
-    config['architecture_version']='low_snr_film_v1'
+    config['architecture_version']='low_snr_film_clean_physics_v1' if a.training_target=='clean_physics' else 'low_snr_film_v1'
     # Preserve configuration compatibility with older full four-model runs.
     if a.regimes==['large','small']:config.pop('regimes')
     if a.model_kinds==['hybrid','direct']:config.pop('model_kinds')
@@ -126,6 +157,7 @@ def main():
     sim=Simulator(a.geometry_seed,a.paths,a.pair_start,a.training_snrs,a.training_snr_probs).to(device)
     print('Training SNR sampling:',dict(zip(a.training_snrs,a.training_snr_probs)),flush=True)
     print('Noise conditioning:',a.noise_conditioning,flush=True)
+    print('Training target:',a.training_target,flush=True)
     torch.save(sim.state_dict(),a.output/'geometry.pt')
     bridges={};infos=[]
     for label,alpha in regimes:
@@ -160,22 +192,39 @@ def main():
                 else:
                     initial,_=evaluate(model,sim,alpha,a.validation_scenes,a.batch_size,1000000000+seed*10000)
                     best=float(initial.mean())
+                    initial_info={'nmse':best}
+                    if a.training_target=='clean_physics':
+                        initial_denoise=evaluate_clean_physics(model,sim,alpha,a.validation_scenes,a.batch_size,1000000000+seed*10000)
+                        initial_info['clean_physics_nmse']=float(initial_denoise.mean())
                     save_checkpoint({'model':state(model),'epoch':0,'validation_nmse':best},folder/'best.pt')
-                    (folder/'initial_validation.json').write_text(json.dumps({'nmse':best}))
+                    (folder/'initial_validation.json').write_text(json.dumps(initial_info))
                 for epoch in range(start,a.epochs) if not finished else []:
                     model.train();total=0.;clock=time.time()
                     for step in range(a.steps):
                         # All four arms receive matching latent scenes and standardized noise.
-                        data=sim.batch(a.batch_size,1000000+seed*100000+epoch*a.steps+step,alpha)
+                        data=sim.batch(a.batch_size,1000000+seed*100000+epoch*a.steps+step,alpha,
+                                       return_clean=(a.training_target=='clean_physics'))
                         opt.zero_grad(set_to_none=True)
                         prediction=model(data['x'],data['variance'],data['scale'])
-                        loss=nmse(prediction,data['y']).mean()
+                        if a.training_target=='clean_physics':
+                            # Denoising supervision: learn H_phys(clean)-H_phys(noisy) implicitly
+                            # by matching the final hybrid output to noiseless PhysicsBridge output.
+                            target_for_loss=clean_physics_target(model.bridge,data)
+                        else:
+                            target_for_loss=data['y']
+                        loss=nmse(prediction,target_for_loss).mean()
                         if not torch.isfinite(loss):raise RuntimeError(f'Nonfinite loss: {arm}, epoch {epoch}')
                         loss.backward();torch.nn.utils.clip_grad_norm_(model.parameters(),1.)
                         opt.step();total+=float(loss.detach())
                     vals,_=evaluate(model,sim,alpha,a.validation_scenes,a.batch_size,1000000000+seed*10000)
                     val=float(vals.mean())
-                    if not math.isfinite(val):raise RuntimeError('Nonfinite validation error')
+                    denoise_val=None
+                    if a.training_target=='clean_physics':
+                        denoise_vals=evaluate_clean_physics(model,sim,alpha,a.validation_scenes,a.batch_size,1000000000+seed*10000)
+                        denoise_val=float(denoise_vals.mean())
+                    if not math.isfinite(val) or (denoise_val is not None and not math.isfinite(denoise_val)):
+                        raise RuntimeError('Nonfinite validation error')
+                    # Checkpoint selection stays tied to TRUE undeformed-channel NMSE.
                     scheduler.step(val)
                     if val<best:
                         best=val;best_epoch=epoch+1;stale=0
@@ -183,12 +232,16 @@ def main():
                     else:stale+=1
                     # At least 50 epochs, then stop only after sustained validation stagnation and LR reductions.
                     finished=(epoch+1==a.epochs) or (epoch+1>=50 and stale>=25 and opt.param_groups[0]['lr']<=3.75e-5)
-                    history.append(dict(epoch=epoch+1,train_nmse=total/a.steps,validation_nmse=val,
-                                        learning_rate=opt.param_groups[0]['lr'],seconds=time.time()-clock))
+                    row=dict(epoch=epoch+1,train_nmse=total/a.steps,validation_nmse=val,
+                             learning_rate=opt.param_groups[0]['lr'],seconds=time.time()-clock)
+                    if denoise_val is not None:
+                        row['validation_clean_physics_nmse']=denoise_val
+                    history.append(row)
                     write_csv(folder/'history.csv',history)
                     save_checkpoint({'model':state(model),'optimizer':opt.state_dict(),'scheduler':scheduler.state_dict(),
                         'epoch':epoch+1,'best':best,'best_epoch':best_epoch,'stale':stale,'history':history,'finished':finished},last)
-                    print(f'{seed} {arm} {epoch+1}/{a.epochs}: train={total/a.steps:.5g}, val={val:.5g}, lr={opt.param_groups[0]["lr"]:.3g}',flush=True)
+                    extra=f', clean-phys={denoise_val:.5g}' if denoise_val is not None else ''
+                    print(f'{seed} {arm} {epoch+1}/{a.epochs}: train={total/a.steps:.5g}, val={val:.5g}{extra}, lr={opt.param_groups[0]["lr"]:.3g}',flush=True)
                     if finished:break
                 if a.train_only:
                     del model,opt,scheduler
@@ -220,6 +273,7 @@ def main():
                 f'{len(regimes)*len(set(a.model_kinds))} models per seed; fresh initialization unless --resume was explicitly supplied.',
                 f'Low-SNR-biased training distribution: {dict(zip(a.training_snrs,a.training_snr_probs))}.',
                 f'Noise conditioning: {a.noise_conditioning}.',
+                f'Training target: {a.training_target}.',
                 'Validation selected best.pt and controlled the learning rate; no test scenes were evaluated.',
                 'Keep the entire results directory, including bridge_*.pt, geometry.pt and seed_* checkpoints.',
                 'Use evaluate_sweep.py later to generate NMSE comparisons.']
@@ -244,6 +298,7 @@ def main():
            f'Large alpha={a.large_alpha}; matched small alpha={a.small_alpha}. Desired gap <= {a.gap_target_db} dB.',
            f'Low-SNR-biased training distribution: {dict(zip(a.training_snrs,a.training_snr_probs))}.',
            f'Noise conditioning: {a.noise_conditioning}.',
+           f'Training target: {a.training_target}.',
            'Scores below pool equal-size test sets across seeds before converting mean NMSE to dB.',
            '| Model | SNR | Large NMSE dB | Small NMSE dB | Gap dB |','|---|---|---|---|---|']
     for kind in ['hybrid','direct','physics','mean_view','first_view']:

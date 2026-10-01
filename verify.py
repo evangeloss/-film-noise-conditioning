@@ -5,6 +5,7 @@ import torch
 from simulator import Simulator,pack,unpack
 from bridge import build_bridge
 from model import Reconstructor,nmse
+from train import clean_physics_target
 import reference_physics as ref
 
 
@@ -60,9 +61,16 @@ def main():
     model=Reconstructor(bridge,True,8,'film')
     pred=model(b['x'][:2],b['variance'][:2],b['scale'][:2])
     torch.testing.assert_close(pred,bridge(b['x'][:2],b['variance'][:2]))
-    loss=nmse(pred,b['y'][:2]).mean();loss.backward()
+
+    # Clean-physics denoising target: same scene normalization, but clean observations and zero noise.
+    denoise_data=sim.batch(2,12345,.5,-10,return_clean=True)
+    clean_target=clean_physics_target(bridge,denoise_data)
+    noisy_base=bridge(denoise_data['x'],denoise_data['variance'])
+    assert torch.isfinite(clean_target).all() and not torch.allclose(clean_target,noisy_base)
+    denoise_pred=model(denoise_data['x'],denoise_data['variance'],denoise_data['scale'])
+    loss=nmse(denoise_pred,clean_target).mean();loss.backward()
     assert torch.isfinite(loss) and all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
-    print('PASS: reference steering, packing, paired targets, full-band noise power, noise calibration, bridge algebra, biased-SNR sampler, FiLM initial skip and gradients.')
+    print('PASS: reference steering, packing, paired targets, full-band noise power, noise calibration, bridge algebra, biased-SNR sampler, FiLM initial skip, clean-physics denoising target and gradients.')
     print('Bridge test:',info)
 
 

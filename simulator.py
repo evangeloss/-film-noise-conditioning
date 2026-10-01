@@ -58,7 +58,7 @@ class Simulator(nn.Module):
         return ab[:,:,:,None,:]*au[:,:,None,:,:].conj()
 
     @torch.no_grad()
-    def batch(self,n,seed,alpha,snr=None,return_latents=False):
+    def batch(self,n,seed,alpha,snr=None,return_latents=False,return_clean=False):
         device=self.pb.device
         g=torch.Generator(device=device).manual_seed(seed)
         db=self.directions(n,self.paths,g);du=self.directions(n,self.paths,g)
@@ -111,6 +111,10 @@ class Simulator(nn.Module):
             'rho':rho,
             'difference':difference,
         }
+        # The clean observation can be exposed without returning all scene latents.
+        # This is used only during clean-physics denoiser training.
+        if return_clean:
+            result['clean']=clean
         if return_latents:
             result.update({
                 'db':db,

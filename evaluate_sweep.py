@@ -210,7 +210,7 @@ def main():
         'Only trained amplitudes were evaluated. Lines connect measured points, not additional evaluated conditions.\n'
         'Physics has no training seed (-1 in CSV). Neural curves average linear errors over selected training seeds.\n'
         'All curves use matched propagation/noise draws. Scene pairing depends on evaluation seed and batch size.\n'
-        'Training SNRs: 0,10,20 dB; other SNRs are interpolation or extrapolation, labelled in summary.csv.\n',encoding='utf-8')
+        f"Training SNR support for reference run: {reference.get('training_snrs',[0,10,20])}; other SNR labels are stored in summary.csv.\n",encoding='utf-8')
     (a.output/'run_status.json').write_text(json.dumps({'completed':True}))
     print('\nSaved plots (PNG/PDF/SVG), summaries and per-scene errors to',a.output.resolve())
     print('To display in a notebook: from IPython.display import display, Image; display(Image(filename="'+str(a.output/'01_nmse_vs_snr_db.png')+'"))')
